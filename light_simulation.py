@@ -8,9 +8,9 @@ import signal
 # MQTT Configuration
 broker_address = "broker.emqx.io"
 broker_port = 1883
-topic = "/student_group/light_control"
-heartbeat_topic = "/student_group/device_heartbeat"
-status_topic = "/student_group/device_status"
+topic = "/student_group/light_control/drefault"
+heartbeat_topic = "/student_group/device_heartbeat/drefault"
+status_topic = "/student_group/device_status/drefault"
 client_id = "python_iot_simulator"
 light_state = "OFF"
 class Colors:
@@ -22,6 +22,12 @@ class Colors:
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"{Colors.GREEN}Connected to MQTT Broker!{Colors.ENDC}")
+        
+        # Clear any retained messages
+        client.publish(topic, '', retain=True)
+        time.sleep(0.1)  # Small delay to ensure the message is processed
+        
+        # Now subscribe to the topic
         client.subscribe(topic)
         print(f"{Colors.BLUE}Subscribed to topic: {topic}{Colors.ENDC}")
         print(f"{Colors.YELLOW}Waiting for commands...{Colors.ENDC}")

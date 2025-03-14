@@ -152,8 +152,9 @@
         
         // MQTT Configuration
         const brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
-        const topic = '/student_group/light_control';
-        const heartbeatTopic = '/student_group/device_heartbeat';
+        const topic = '/student_group/light_control/drefault';
+        const heartbeatTopic = '/student_group/device_heartbeat/drefault';
+        const statusTopic = '/student_group/device_status/drefault';
         const clientId = 'web_client_' + Math.random().toString(16).substr(2, 8);
         
         // Connect to MQTT broker
@@ -180,6 +181,14 @@
         let heartbeatTimer = null;
         let lastHeartbeat = 0;
         
+        // Check for stored shutdown state
+        if (localStorage.getItem('deviceShutdown') === 'true') {
+            isDeviceConnected = false;
+            deviceStatusElement.textContent = 'Device: Shutting down';
+            deviceStatusElement.className = 'text-sm text-orange-600 dark:text-orange-400 text-center transition-colors duration-300 mt-2';
+            disableButtons();
+        }
+        
         // Handle connection events
         client.on('connect', () => {
             isConnected = true;
@@ -188,12 +197,21 @@
             console.log('Connected to MQTT broker');
             
             // Subscribe to the topics
-            client.subscribe([topic, heartbeatTopic], function(err) {
+            client.subscribe([topic, heartbeatTopic, statusTopic], function(err) {
                 if (!err) {
                     console.log('Subscribed to topics');
                     
                     // Start checking for device heartbeat
                     startHeartbeatCheck();
+                    
+                    // Check for retained shutdown message
+                    client.subscribe(statusTopic, { qos: 1 });
+                    
+                    // Clear any retained messages if device is not connected
+                    if (!isDeviceConnected && localStorage.getItem('deviceShutdown') === 'true') {
+                        // Publish empty messages with retained flag to clear retained messages
+                        client.publish(topic, '', { retain: true });
+                    }
                 }
             });
         });
@@ -240,22 +258,27 @@
             stopHeartbeatCheck();
         });
         
-        // Heartbeat functions
+        // Function to check for device heartbeat
         function startHeartbeatCheck() {
             // Clear any existing timer
-            stopHeartbeatCheck();
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+            }
             
-            // Check for device heartbeat every 5 seconds
+            // Set up heartbeat check
             heartbeatTimer = setInterval(() => {
                 const now = Date.now();
-                // If no heartbeat received in the last 10 seconds, consider device disconnected
-                if (now - lastHeartbeat > 10000) {
-                    if (isDeviceConnected) {
-                        isDeviceConnected = false;
-                        deviceStatusElement.textContent = 'Device: Not detected';
-                        deviceStatusElement.className = 'text-sm text-red-600 dark:text-red-400 text-center transition-colors duration-300 mt-2';
-                        disableButtons();
-                        
+                const timeSinceLastHeartbeat = now - lastHeartbeat;
+                
+                // If no heartbeat for 10 seconds and device was connected, mark as disconnected
+                if (timeSinceLastHeartbeat > 10000 && isDeviceConnected) {
+                    isDeviceConnected = false;
+                    deviceStatusElement.textContent = 'Device: Not detected';
+                    deviceStatusElement.className = 'text-sm text-red-600 dark:text-red-400 text-center transition-colors duration-300 mt-2';
+                    disableButtons();
+                    
+                    // If we haven't received a shutdown message, but the device is gone
+                    if (localStorage.getItem('deviceShutdown') !== 'true') {
                         // Turn off light if device is disconnected
                         if (currentLightState === 'ON') {
                             turnLightOff();
@@ -265,7 +288,7 @@
                         }
                     }
                 }
-            }, 5000);
+            }, 2000); // Check every 2 seconds
         }
         
         function stopHeartbeatCheck() {
@@ -424,6 +447,9 @@
             const msgContent = message.toString();
             console.log(`Received message on ${topic}: ${msgContent}`);
             
+            // Debug info
+            console.log(`Device connected: ${isDeviceConnected}, Pending operation: ${pendingOperation}, Shutdown state: ${localStorage.getItem('deviceShutdown')}`);
+            
             if (topic === heartbeatTopic) {
                 // Update last heartbeat time
                 lastHeartbeat = Date.now();
@@ -443,18 +469,110 @@
                 return;
             }
             
+            // Handle device status messages
+            if (topic === statusTopic) {
+                if (msgContent === "SHUTDOWN") {
+                    // Device is shutting down
+                    isDeviceConnected = false;
+                    deviceStatusElement.textContent = 'Device: Shutting down';
+                    deviceStatusElement.className = 'text-sm text-orange-600 dark:text-orange-400 text-center transition-colors duration-300 mt-2';
+                    disableButtons();
+                    
+                    // Store shutdown state in localStorage
+                    localStorage.setItem('deviceShutdown', 'true');
+                    
+                    // Turn off light if device is shutting down
+                    if (currentLightState === 'ON') {
+                        turnLightOff();
+                        statusElement.textContent = 'Status: Device shutting down, light turned OFF';
+                        statusElement.className = 'bg-yellow-100 dark:bg-yellow-900/30 p-4 rounded-lg text-center mb-4 text-yellow-800 dark:text-yellow-300 transition-colors duration-300';
+                        currentLightState = 'OFF';
+                    }
+                    return;
+                } else if (msgContent.startsWith("READY:")) {
+                    // Device is ready with initial state - clear shutdown flag
+                    localStorage.removeItem('deviceShutdown');
+                    
+                    // Get the initial state
+                    const initialState = msgContent.split(":")[1];
+                    console.log("Device ready with state:", initialState);
+                    
+                    // Update last heartbeat time
+                    lastHeartbeat = Date.now();
+                    
+                    // Update device status
+                    isDeviceConnected = true;
+                    deviceStatusElement.textContent = 'Device: Connected';
+                    deviceStatusElement.className = 'text-sm text-green-600 dark:text-green-400 text-center transition-colors duration-300 mt-2';
+                    
+                    // Enable buttons if MQTT is also connected
+                    if (isConnected) {
+                        enableButtons();
+                    }
+                    
+                    // Update light state based on device's initial state
+                    if (initialState === "ON" && currentLightState !== "ON") {
+                        statusElement.textContent = 'Status: Light is ON';
+                        statusElement.className = 'bg-green-100 dark:bg-green-900/30 p-4 rounded-lg text-center mb-4 text-green-800 dark:text-green-300 transition-colors duration-300';
+                        turnLightOn();
+                    } else if (initialState === "OFF" && currentLightState !== "OFF") {
+                        statusElement.textContent = 'Status: Light is OFF';
+                        statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
+                        turnLightOff();
+                    }
+                    return;
+                }
+                
+                if (msgContent.startsWith("STATE:")) {
+                    // Device is reporting a state change
+                    const newState = msgContent.split(":")[1];
+                    console.log("Device state changed to:", newState);
+                    
+                    // Update light state based on device's reported state
+                    if (newState === "ON" && currentLightState !== "ON") {
+                        statusElement.textContent = 'Status: Light turned ON';
+                        statusElement.className = 'bg-green-100 dark:bg-green-900/30 p-4 rounded-lg text-center mb-4 text-green-800 dark:text-green-300 transition-colors duration-300';
+                        turnLightOn();
+                    } else if (newState === "OFF" && currentLightState !== "OFF") {
+                        statusElement.textContent = 'Status: Light turned OFF';
+                        statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
+                        turnLightOff();
+                    }
+                    return;
+                }
+            }
+            
             // Handle light control messages
-            if (topic === '/student_group/light_control') {
+            if (topic === '/student_group/light_control/drefault') {
                 hideLoading();
                 
-                if (msgContent === 'ON') {
-                    statusElement.textContent = 'Status: Light turned ON';
-                    statusElement.className = 'bg-green-100 dark:bg-green-900/30 p-4 rounded-lg text-center mb-4 text-green-800 dark:text-green-300 transition-colors duration-300';
-                    turnLightOn();
-                } else if (msgContent === 'OFF') {
-                    statusElement.textContent = 'Status: Light turned OFF';
-                    statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
-                    turnLightOff();
+                // Only process light control messages if the device is connected
+                // or if we're in a pending operation (waiting for response to our own command)
+                if (isDeviceConnected || pendingOperation) {
+                    // Store the last command time to prevent duplicate processing
+                    const now = Date.now();
+                    const lastCommandKey = 'lastCommand_' + msgContent;
+                    const lastCommandTime = parseInt(localStorage.getItem(lastCommandKey) || '0');
+                    
+                    // Only process if it's been more than 2 seconds since the last identical command
+                    // This prevents rapid toggling from retained messages
+                    if (now - lastCommandTime > 2000) {
+                        localStorage.setItem(lastCommandKey, now.toString());
+                        
+                        if (msgContent === 'ON') {
+                            statusElement.textContent = 'Status: Light turned ON';
+                            statusElement.className = 'bg-green-100 dark:bg-green-900/30 p-4 rounded-lg text-center mb-4 text-green-800 dark:text-green-300 transition-colors duration-300';
+                            turnLightOn();
+                        } else if (msgContent === 'OFF') {
+                            statusElement.textContent = 'Status: Light turned OFF';
+                            statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
+                            turnLightOff();
+                        }
+                    } else {
+                        console.log('Ignoring duplicate command received too quickly:', msgContent);
+                    }
+                } else {
+                    console.log('Ignoring light control message because device is not connected:', msgContent);
                 }
             }
         });
