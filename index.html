@@ -57,6 +57,24 @@
         .room-light.illuminated::before {
             opacity: 1;
         }
+
+        /* Loading spinner for MQTT operations */
+        .spinner {
+            border: 3px solid rgba(0, 0, 0, 0.1);
+            border-radius: 50%;
+            border-top: 3px solid #3498db;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+            margin-left: 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body class="bg-gray-100 dark:bg-dark-300 min-h-screen flex items-center justify-center p-4 transition-colors duration-300">
@@ -83,10 +101,10 @@
         </div>
         
         <div class="flex justify-center space-x-4 mb-8">
-            <button id="onButton" class="bg-green-500 hover:bg-green-600 dark:bg-green-600 dark:hover:bg-green-700 text-white font-medium py-3 px-6 rounded-lg transition-colors duration-300">
+            <button id="onButton" class="bg-green-500 hover:bg-green-600 dark:bg-green-600 dark:hover:bg-green-700 text-white font-medium py-3 px-6 rounded-lg transition-colors duration-300" disabled>
                 Turn ON
             </button>
-            <button id="offButton" class="bg-red-500 hover:bg-red-600 dark:bg-red-600 dark:hover:bg-red-700 text-white font-medium py-3 px-6 rounded-lg transition-colors duration-300">
+            <button id="offButton" class="bg-red-500 hover:bg-red-600 dark:bg-red-600 dark:hover:bg-red-700 text-white font-medium py-3 px-6 rounded-lg transition-colors duration-300" disabled>
                 Turn OFF
             </button>
         </div>
@@ -97,6 +115,10 @@
         
         <div id="connectionStatus" class="text-sm text-gray-600 dark:text-gray-400 text-center transition-colors duration-300">
             MQTT Connection: Disconnected
+        </div>
+        
+        <div id="deviceStatus" class="text-sm text-gray-600 dark:text-gray-400 text-center transition-colors duration-300 mt-2">
+            Device: Not detected
         </div>
     </div>
     
@@ -131,6 +153,7 @@
         // MQTT Configuration
         const brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
         const topic = '/student_group/light_control';
+        const heartbeatTopic = '/student_group/device_heartbeat';
         const clientId = 'web_client_' + Math.random().toString(16).substr(2, 8);
         
         // Connect to MQTT broker
@@ -146,26 +169,125 @@
         const offButton = document.getElementById('offButton');
         const statusElement = document.getElementById('status');
         const connectionStatusElement = document.getElementById('connectionStatus');
+        const deviceStatusElement = document.getElementById('deviceStatus');
         const lightSimulation = document.getElementById('lightSimulation');
+        
+        // Track connection and light state
+        let isConnected = false;
+        let isDeviceConnected = false;
+        let currentLightState = 'OFF';
+        let pendingOperation = false;
+        let heartbeatTimer = null;
+        let lastHeartbeat = 0;
         
         // Handle connection events
         client.on('connect', () => {
+            isConnected = true;
             connectionStatusElement.textContent = 'MQTT Connection: Connected';
             connectionStatusElement.className = 'text-sm text-green-600 dark:text-green-400 text-center transition-colors duration-300';
             console.log('Connected to MQTT broker');
+            
+            // Subscribe to the topics
+            client.subscribe([topic, heartbeatTopic], function(err) {
+                if (!err) {
+                    console.log('Subscribed to topics');
+                    
+                    // Start checking for device heartbeat
+                    startHeartbeatCheck();
+                }
+            });
         });
         
         client.on('error', (error) => {
+            isConnected = false;
             connectionStatusElement.textContent = 'MQTT Connection: Error - ' + error.message;
             connectionStatusElement.className = 'text-sm text-red-600 dark:text-red-400 text-center transition-colors duration-300';
             console.error('MQTT connection error:', error);
+            
+            // Disable buttons when connection fails
+            disableButtons();
+            
+            // Turn off light if connection is lost
+            if (currentLightState === 'ON') {
+                turnLightOff();
+                statusElement.textContent = 'Status: Connection lost, light turned OFF';
+                statusElement.className = 'bg-yellow-100 dark:bg-yellow-900/30 p-4 rounded-lg text-center mb-4 text-yellow-800 dark:text-yellow-300 transition-colors duration-300';
+                currentLightState = 'OFF';
+            }
+            
+            // Stop heartbeat check
+            stopHeartbeatCheck();
         });
         
         client.on('offline', () => {
+            isConnected = false;
             connectionStatusElement.textContent = 'MQTT Connection: Disconnected';
             connectionStatusElement.className = 'text-sm text-red-600 dark:text-red-400 text-center transition-colors duration-300';
             console.log('Disconnected from MQTT broker');
+            
+            // Disable buttons when disconnected
+            disableButtons();
+            
+            // Turn off light if connection is lost
+            if (currentLightState === 'ON') {
+                turnLightOff();
+                statusElement.textContent = 'Status: Connection lost, light turned OFF';
+                statusElement.className = 'bg-yellow-100 dark:bg-yellow-900/30 p-4 rounded-lg text-center mb-4 text-yellow-800 dark:text-yellow-300 transition-colors duration-300';
+                currentLightState = 'OFF';
+            }
+            
+            // Stop heartbeat check
+            stopHeartbeatCheck();
         });
+        
+        // Heartbeat functions
+        function startHeartbeatCheck() {
+            // Clear any existing timer
+            stopHeartbeatCheck();
+            
+            // Check for device heartbeat every 5 seconds
+            heartbeatTimer = setInterval(() => {
+                const now = Date.now();
+                // If no heartbeat received in the last 10 seconds, consider device disconnected
+                if (now - lastHeartbeat > 10000) {
+                    if (isDeviceConnected) {
+                        isDeviceConnected = false;
+                        deviceStatusElement.textContent = 'Device: Not detected';
+                        deviceStatusElement.className = 'text-sm text-red-600 dark:text-red-400 text-center transition-colors duration-300 mt-2';
+                        disableButtons();
+                        
+                        // Turn off light if device is disconnected
+                        if (currentLightState === 'ON') {
+                            turnLightOff();
+                            statusElement.textContent = 'Status: Device disconnected, light turned OFF';
+                            statusElement.className = 'bg-yellow-100 dark:bg-yellow-900/30 p-4 rounded-lg text-center mb-4 text-yellow-800 dark:text-yellow-300 transition-colors duration-300';
+                            currentLightState = 'OFF';
+                        }
+                    }
+                }
+            }, 5000);
+        }
+        
+        function stopHeartbeatCheck() {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        }
+        
+        function disableButtons() {
+            onButton.disabled = true;
+            offButton.disabled = true;
+            onButton.classList.add('opacity-50', 'cursor-not-allowed');
+            offButton.classList.add('opacity-50', 'cursor-not-allowed');
+        }
+        
+        function enableButtons() {
+            onButton.disabled = false;
+            offButton.disabled = false;
+            onButton.classList.remove('opacity-50', 'cursor-not-allowed');
+            offButton.classList.remove('opacity-50', 'cursor-not-allowed');
+        }
         
         // Function to turn the light on
         function turnLightOn() {
@@ -187,6 +309,8 @@
                 // Remove room illumination
                 roomContainer.classList.remove('illuminated');
             }
+            
+            currentLightState = 'ON';
         }
         
         // Function to turn the light off
@@ -204,47 +328,134 @@
             
             // Remove room illumination
             roomContainer.classList.remove('illuminated');
+            
+            currentLightState = 'OFF';
+        }
+        
+        // Add loading spinner to status
+        function showLoading() {
+            const spinner = document.createElement('span');
+            spinner.className = 'spinner';
+            spinner.id = 'loadingSpinner';
+            statusElement.appendChild(spinner);
+            pendingOperation = true;
+        }
+        
+        // Remove loading spinner
+        function hideLoading() {
+            const spinner = document.getElementById('loadingSpinner');
+            if (spinner) {
+                spinner.remove();
+            }
+            pendingOperation = false;
         }
         
         // Button event listeners
         onButton.addEventListener('click', () => {
-            client.publish(topic, 'ON', { qos: 1 });
-            statusElement.textContent = 'Status: Light turned ON';
-            statusElement.className = 'bg-green-100 dark:bg-green-900/30 p-4 rounded-lg text-center mb-4 text-green-800 dark:text-green-300 transition-colors duration-300';
-            turnLightOn();
-            console.log('Published: ON');
+            if (!isConnected || !isDeviceConnected || pendingOperation) return;
+            
+            // Show loading state
+            statusElement.textContent = 'Status: Sending ON command... ';
+            statusElement.className = 'bg-blue-100 dark:bg-blue-900/30 p-4 rounded-lg text-center mb-4 text-blue-800 dark:text-blue-300 transition-colors duration-300';
+            showLoading();
+            
+            // Disable buttons during operation
+            onButton.disabled = true;
+            offButton.disabled = true;
+            
+            // Publish with QoS 1 to ensure delivery
+            client.publish(topic, 'ON', { qos: 1 }, (error) => {
+                hideLoading();
+                
+                // Re-enable buttons
+                if (isConnected && isDeviceConnected) {
+                    onButton.disabled = false;
+                    offButton.disabled = false;
+                }
+                
+                if (error) {
+                    console.error('Failed to publish message:', error);
+                    statusElement.textContent = 'Status: Failed to send command';
+                    statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
+                    return;
+                }
+                
+                console.log('Published: ON');
+                // Don't update UI here - wait for message to come back via subscription
+            });
         });
         
         offButton.addEventListener('click', () => {
-            client.publish(topic, 'OFF', { qos: 1 });
-            statusElement.textContent = 'Status: Light turned OFF';
-            statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
-            turnLightOff();
-            console.log('Published: OFF');
-        });
-        
-        // Subscribe to the same topic to sync UI if other clients change the light state
-        client.on('connect', () => {
-            client.subscribe(topic, function(err) {
-                if (!err) {
-                    console.log('Subscribed to topic:', topic);
+            if (!isConnected || !isDeviceConnected || pendingOperation) return;
+            
+            // Show loading state
+            statusElement.textContent = 'Status: Sending OFF command... ';
+            statusElement.className = 'bg-blue-100 dark:bg-blue-900/30 p-4 rounded-lg text-center mb-4 text-blue-800 dark:text-blue-300 transition-colors duration-300';
+            showLoading();
+            
+            // Disable buttons during operation
+            onButton.disabled = true;
+            offButton.disabled = true;
+            
+            // Publish with QoS 1 to ensure delivery
+            client.publish(topic, 'OFF', { qos: 1 }, (error) => {
+                hideLoading();
+                
+                // Re-enable buttons
+                if (isConnected && isDeviceConnected) {
+                    onButton.disabled = false;
+                    offButton.disabled = false;
                 }
+                
+                if (error) {
+                    console.error('Failed to publish message:', error);
+                    statusElement.textContent = 'Status: Failed to send command';
+                    statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
+                    return;
+                }
+                
+                console.log('Published: OFF');
+                // Don't update UI here - wait for message to come back via subscription
             });
         });
         
         // Handle incoming messages
         client.on('message', (topic, message) => {
-            const command = message.toString();
-            console.log('Received message:', command);
+            const msgContent = message.toString();
+            console.log(`Received message on ${topic}: ${msgContent}`);
             
-            if (command === 'ON') {
-                statusElement.textContent = 'Status: Light turned ON';
-                statusElement.className = 'bg-green-100 dark:bg-green-900/30 p-4 rounded-lg text-center mb-4 text-green-800 dark:text-green-300 transition-colors duration-300';
-                turnLightOn();
-            } else if (command === 'OFF') {
-                statusElement.textContent = 'Status: Light turned OFF';
-                statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
-                turnLightOff();
+            if (topic === heartbeatTopic) {
+                // Update last heartbeat time
+                lastHeartbeat = Date.now();
+                
+                // Update device status if needed
+                if (!isDeviceConnected) {
+                    isDeviceConnected = true;
+                    deviceStatusElement.textContent = 'Device: Connected';
+                    deviceStatusElement.className = 'text-sm text-green-600 dark:text-green-400 text-center transition-colors duration-300 mt-2';
+                    
+                    // Enable buttons if MQTT is also connected
+                    if (isConnected) {
+                        enableButtons();
+                    }
+                }
+                
+                return;
+            }
+            
+            // Handle light control messages
+            if (topic === '/student_group/light_control') {
+                hideLoading();
+                
+                if (msgContent === 'ON') {
+                    statusElement.textContent = 'Status: Light turned ON';
+                    statusElement.className = 'bg-green-100 dark:bg-green-900/30 p-4 rounded-lg text-center mb-4 text-green-800 dark:text-green-300 transition-colors duration-300';
+                    turnLightOn();
+                } else if (msgContent === 'OFF') {
+                    statusElement.textContent = 'Status: Light turned OFF';
+                    statusElement.className = 'bg-red-100 dark:bg-red-900/30 p-4 rounded-lg text-center mb-4 text-red-800 dark:text-red-300 transition-colors duration-300';
+                    turnLightOff();
+                }
             }
         });
         
@@ -254,6 +465,9 @@
                 turnLightOff(); // Update the off state based on current theme
             }
         });
+        
+        // Initial state - buttons disabled until connected
+        disableButtons();
     </script>
 </body>
 </html> 
